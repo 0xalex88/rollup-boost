@@ -82,6 +82,14 @@ struct Args {
     #[arg(
         long,
         env,
+        default_value = "false",
+        help = "Enable brotli decompression on messages from upstream servers"
+    )]
+    enable_decompression: bool,
+
+    #[arg(
+        long,
+        env,
         default_value = "X-Forwarded-For",
         help = "Header to use to determine the clients origin IP"
     )]
@@ -278,6 +286,7 @@ async fn main() {
         let listener_clone = listener.clone();
         let token_clone = token.clone();
         let metrics_clone = metrics.clone();
+        let enable_decompression = args.enable_decompression;
 
         let options = SubscriberOptions::default()
             .with_max_backoff_interval(Duration::from_millis(args.subscriber_max_interval_ms))
@@ -286,8 +295,13 @@ async fn main() {
             .with_backoff_initial_interval(Duration::from_millis(500))
             .with_initial_grace_period(Duration::from_secs(5));
 
-        let mut subscriber =
-            WebsocketSubscriber::new(uri_clone.clone(), listener_clone, metrics_clone, options);
+        let mut subscriber = WebsocketSubscriber::new(
+            uri_clone.clone(),
+            listener_clone,
+            metrics_clone,
+            options,
+            enable_decompression,
+        );
 
         let task = tokio::spawn(async move {
             info!(

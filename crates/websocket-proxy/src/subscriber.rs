@@ -2,6 +2,7 @@ use crate::metrics::Metrics;
 use axum::http::Uri;
 use backoff::{backoff::Backoff, ExponentialBackoff};
 use futures::{SinkExt, StreamExt};
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
@@ -70,13 +71,20 @@ where
     backoff: ExponentialBackoff,
     metrics: Arc<Metrics>,
     options: SubscriberOptions,
+    enable_decompression: bool,
 }
 
 impl<F> WebsocketSubscriber<F>
 where
     F: Fn(String) + Send + Sync + 'static,
 {
-    pub fn new(uri: Uri, handler: F, metrics: Arc<Metrics>, options: SubscriberOptions) -> Self {
+    pub fn new(
+        uri: Uri,
+        handler: F,
+        metrics: Arc<Metrics>,
+        options: SubscriberOptions,
+        enable_decompression: bool,
+    ) -> Self {
         let backoff = ExponentialBackoff {
             initial_interval: options.backoff_initial_interval,
             max_interval: options.max_backoff_interval,
@@ -90,6 +98,7 @@ where
             backoff,
             metrics,
             options,
+            enable_decompression,
         }
     }
 
@@ -258,11 +267,44 @@ where
                 (self.handler)(text.to_string());
             }
             Message::Binary(data) => {
-                warn!(
-                    message = "received binary message, unsupported",
-                    uri = self.uri.to_string(),
-                    size = data.len()
-                );
+                if self.enable_decompression {
+                    trace!(
+                        message = "received binary message, attempting decompression",
+                        uri = self.uri.to_string(),
+                        size = data.len()
+                    );
+
+                    let mut decompressed = String::new();
+                    match brotli::Decompressor::new(&data[..], 4096)
+                        .read_to_string(&mut decompressed)
+                    {
+                        Ok(_) => {
+                            trace!(
+                                message = "decompressed binary message",
+                                uri = self.uri.to_string(),
+                                original_size = data.len(),
+                                decompressed_size = decompressed.len()
+                            );
+                            self.metrics
+                                .message_received_from_upstream(self.uri.to_string().as_str());
+                            (self.handler)(decompressed);
+                        }
+                        Err(e) => {
+                            warn!(
+                                message = "failed to decompress binary message",
+                                uri = self.uri.to_string(),
+                                size = data.len(),
+                                error = e.to_string()
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        message = "received binary message, unsupported",
+                        uri = self.uri.to_string(),
+                        size = data.len()
+                    );
+                }
             }
             Message::Pong(_) => {
                 trace!(
@@ -450,8 +492,13 @@ mod tests {
             .with_pong_timeout(Duration::from_millis(200))
             .with_initial_grace_period(Duration::from_millis(50));
 
-        let mut subscriber =
-            WebsocketSubscriber::new(uri, listener_fn, Arc::new(Metrics::default()), options);
+        let mut subscriber = WebsocketSubscriber::new(
+            uri,
+            listener_fn,
+            Arc::new(Metrics::default()),
+            options,
+            false,
+        );
 
         let subscriber_task = {
             let token_clone = shutdown.clone();
@@ -503,6 +550,7 @@ mod tests {
             listener_clone1,
             metrics_clone1,
             SubscriberOptions::default(),
+            false,
         );
 
         let uri2 = server2.uri();
@@ -514,6 +562,7 @@ mod tests {
             listener_clone2,
             metrics_clone2,
             SubscriberOptions::default(),
+            false,
         );
 
         let task1 = tokio::spawn(async move {
